@@ -1,0 +1,14 @@
+services:
+  rabbitmq:
+    image: rabbitmq:3.9.7
+    ports:
+      - 5672:5672
+    environment:
+      RABBITMQ_NODENAME: rabbitmq@rabbitmq
+  psql:
+    container_name: psql
+    image: postgres:14.0
+    ports:
+      - 5432:5432
+    environment:
+      POSTGRES_PASSWORD: psqlpassword
