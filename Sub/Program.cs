@@ -1,10 +1,8 @@
 ﻿using System;
-using System.IO;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using EasyNetQ;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
 using Shared;
 
 namespace Sub
@@ -20,8 +18,13 @@ namespace Sub
         private static (ChannelWriter<T>, Task) CreateChannel<T>(
                 Func<ChannelReader<T>, Task> handler)
         {
+            // Unbounded channels could be a problem in internet-facing situations.
+            // Used internally between two programs here, with a single producer
+            //   and handling at most two messages at a time. 
             var channel = Channel.CreateUnbounded<T>();
             var (channelReader, channelWriter) = (channel.Reader, channel.Writer);
+
+            // Inject the channel reader into the handler and run the task
             var task = Task.Run(async () => await handler(channelReader));
             return (channelWriter, task);
         }
@@ -32,16 +35,21 @@ namespace Sub
         /// <param name="reader">The <see cref="ChannelReader{T}"/> to receive messages from.</param>
         private static async Task HandleMessageDb(ChannelReader<MessageObject> reader)
         {
+            // Connect to the running Database 
             await using var db = new MessageContext();
 
+            // Make sure the database has had the migrations run
+            // Because of this we don't have to manually run `dotnet ef database update`
             await db.Database.MigrateAsync();
 
             Console.WriteLine("Migrated DB and awaiting message to publish in DB");
 
+            // Waits until there is new messages or the associated writer has been closed
             while (await reader.WaitToReadAsync())
             {
                 while (reader.TryRead(out var message))
                 {
+                    // Convert the incoming message object to a DB message and save it in the database 
                     await db.Messages.AddAsync(new Message(message));
                     await db.SaveChangesAsync();
                 }
@@ -56,6 +64,8 @@ namespace Sub
         private static async Task HandleSendMessage(ChannelReader<MessageObject> reader, IBus bus)
         {
             Console.WriteLine("Awaiting message to re-publish");
+
+            // Waits until there is new messages or the associated writer has been closed
             while (await reader.WaitToReadAsync())
             {
                 while (reader.TryRead(out var item))
@@ -67,6 +77,12 @@ namespace Sub
             }
         }
 
+        /// <summary>
+        /// Handle incoming messages from the message queue.
+        /// </summary>
+        /// <param name="message">The <see cref="MessageObject"/> to evaluate and forward.</param>
+        /// <param name="dbChannelWriter">The <see cref="ChannelWriter{T}"/> for forwarding to the database.</param>
+        /// <param name="mqChannelWriter">The <see cref="ChannelWriter{T}"/> for re-forwarding to the message queue</param>
         private static async Task HandleIncomingMessage(MessageObject message,
                                                         ChannelWriter<MessageObject> dbChannelWriter,
                                                         ChannelWriter<MessageObject> mqChannelWriter)
@@ -82,7 +98,7 @@ namespace Sub
             // Check if message timestamp is even
             if (message.Timestamp.Second % 2 == 0)
             {
-                // Send even messages to be handled by DB
+                // Send even timestamped messages to be handled by DB
                 await dbChannelWriter.WriteAsync(message);
             }
             else
@@ -94,6 +110,7 @@ namespace Sub
                 // Timestamp is odd. Give the message a new one.
                 // This results in a lot of chatter with the message queue.
                 // Use the out-commented implementation above to test without the chatter. 
+                //   (this is ripe for using a facade pattern)
                 message.Timestamp = DateTime.Now;
 
                 // Send odd 
@@ -103,20 +120,6 @@ namespace Sub
 
         private static async Task Main()
         {
-            #region Load configuration
-
-            var builder = new ConfigurationBuilder()
-                         .SetBasePath(Directory.GetCurrentDirectory())
-                         .AddJsonFile("appsettings.json", false);
-
-            var config = builder.Build();
-
-            // Load MQ and DB options
-            // ReSharper disable once UnusedVariable
-            var options = config.GetSection("Options").Get<SubOptions>();
-
-            #endregion
-
             // Connect to RabbitMQ using the default guest:guest account
             var bus = RabbitHutch.CreateBus("host=localhost");
 
@@ -138,7 +141,7 @@ namespace Sub
                 await HandleSendMessage(reader, bus);
             });
 
-            // Register message handler on the 'pubsub' queue
+            // Wrap the message handler in a message-receiving delegate
             var receiver = await bus.SendReceive.ReceiveAsync<MessageObject>(
                     "pubsub",
                     async message => { await HandleIncomingMessage(message, dbChannelWriter, mqChannelWriter); }
@@ -155,6 +158,7 @@ namespace Sub
             mqChannelWriter.Complete();
             dbChannelWriter.Complete();
 
+            // Wait for the handler tasks to stop running as the writers have been completed
             await Task.WhenAll(mqTask, dbTask);
 
             // Close connection to RabbitMQ
